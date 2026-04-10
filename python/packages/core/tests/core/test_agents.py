@@ -1,9 +1,11 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 import contextlib
-from collections.abc import AsyncIterable, MutableSequence
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+import inspect
+import json
+from collections.abc import AsyncIterable, Awaitable, Callable, MutableSequence, Sequence
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -16,21 +18,29 @@ from agent_framework import (
     AgentResponse,
     AgentResponseUpdate,
     AgentSession,
-    BaseContextProvider,
+    ChatContext,
     ChatOptions,
     ChatResponse,
     ChatResponseUpdate,
     Content,
+    ContextProvider,
     FunctionTool,
+    HistoryProvider,
+    InMemoryHistoryProvider,
     Message,
+    ResponseStream,
+    SessionContext,
     SlidingWindowStrategy,
     SupportsAgentRun,
     SupportsChatGetResponse,
     TruncationStrategy,
+    chat_middleware,
     tool,
 )
 from agent_framework._agents import _get_tool_name, _merge_options, _sanitize_agent_name
-from agent_framework._mcp import MCPTool
+from agent_framework._mcp import MCPTool, _build_prefixed_mcp_name, _normalize_mcp_name
+from agent_framework._middleware import FunctionInvocationContext
+from agent_framework.exceptions import AgentInvalidRequestException, ChatClientInvalidResponseException
 
 
 class _FixedTokenizer:
@@ -39,6 +49,73 @@ class _FixedTokenizer:
 
     def count_tokens(self, text: str) -> int:
         return self.token_count
+
+
+class _ConnectedMCPTool(MCPTool):
+    def __init__(self, name: str, function_names: list[str], *, tool_name_prefix: str | None = None) -> None:
+        super().__init__(name=name, tool_name_prefix=tool_name_prefix)
+        self.is_connected = True
+        self._functions = []
+        for function_name in function_names:
+            normalized_name = _normalize_mcp_name(function_name)
+            exposed_name = _build_prefixed_mcp_name(normalized_name, self.tool_name_prefix)
+            self._functions.append(
+                FunctionTool(
+                    func=lambda value=function_name: value,
+                    name=exposed_name,
+                    description=f"{function_name} from {name}",
+                    additional_properties={
+                        "_mcp_remote_name": function_name,
+                        "_mcp_normalized_name": normalized_name,
+                    },
+                )
+            )
+
+    def get_mcp_client(self) -> contextlib.AbstractAsyncContextManager[Any]:
+        raise NotImplementedError
+
+
+class _RecordingHistoryProvider(HistoryProvider):
+    def __init__(self, source_id: str = "recording_history") -> None:
+        super().__init__(source_id=source_id)
+
+    async def get_messages(
+        self,
+        session_id: str | None,
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Message]:
+        if state is None:
+            return []
+        state["get_call_count"] = state.get("get_call_count", 0) + 1
+        return list(cast(list[Message], state.get("messages", [])))
+
+    async def save_messages(
+        self,
+        session_id: str | None,
+        messages: Sequence[Message],
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if state is None:
+            return
+        state["save_call_count"] = state.get("save_call_count", 0) + 1
+        state.setdefault("messages", []).extend(messages)
+
+
+class _ResponseIdRecordingHistoryProvider(_RecordingHistoryProvider):
+    async def after_run(
+        self,
+        *,
+        agent: SupportsAgentRun,
+        session: AgentSession,
+        context: SessionContext,
+        state: dict[str, Any],
+    ) -> None:
+        state.setdefault("response_ids", []).append(context.response.response_id if context.response else None)
+        await super().after_run(agent=agent, session=session, context=context, state=state)
 
 
 def test_agent_session_type(agent_session: AgentSession) -> None:
@@ -77,6 +154,48 @@ def test_chat_client_agent_type(client: SupportsChatGetResponse) -> None:
     assert isinstance(chat_client_agent, SupportsAgentRun)
 
 
+def test_chat_client_agent_uses_client_model_attribute(chat_client_base) -> None:
+    chat_client_base.model = "claude-model"  # type: ignore[attr-defined]
+
+    agent = Agent(client=chat_client_base)
+
+    assert agent.default_options["model"] == "claude-model"
+    assert "model_id" not in agent.default_options
+
+
+def test_chat_client_agent_prefers_default_model_over_client_model(chat_client_base) -> None:
+    chat_client_base.model = "legacy-model"  # type: ignore[attr-defined]
+
+    agent = Agent(client=chat_client_base, default_options={"model": "claude-model"})
+
+    assert agent.default_options["model"] == "claude-model"
+    assert "model_id" not in agent.default_options
+
+
+def test_agent_init_docstring_surfaces_raw_agent_constructor_docs() -> None:
+    docstring = inspect.getdoc(Agent.__init__)
+
+    assert docstring is not None
+    assert "client: The chat client to use for the agent." in docstring
+    assert "middleware: List of middleware to intercept agent and function invocations." in docstring
+
+
+def test_agent_run_docstring_surfaces_raw_agent_runtime_docs() -> None:
+    docstring = inspect.getdoc(Agent.run)
+
+    assert docstring is not None
+    assert "Run the agent with the given messages and options." in docstring
+    assert "function_invocation_kwargs: Keyword arguments forwarded to tool invocation." in docstring
+    assert "middleware: Optional per-run agent, chat, and function middleware." in docstring
+
+
+def test_agent_run_is_defined_on_agent_class() -> None:
+    signature = inspect.signature(Agent.run)
+
+    assert Agent.run.__qualname__ == "Agent.run"
+    assert "middleware" in signature.parameters
+
+
 async def test_chat_client_agent_init(client: SupportsChatGetResponse) -> None:
     agent_id = str(uuid4())
     agent = Agent(client=client, id=agent_id, description="Test")
@@ -95,6 +214,11 @@ async def test_chat_client_agent_init_with_name(
     assert agent.id == agent_id
     assert agent.name == "Test Agent"
     assert agent.description == "Test"
+
+
+def test_agent_init_rejects_direct_additional_properties(client: SupportsChatGetResponse) -> None:
+    with pytest.raises(TypeError):
+        Agent(client=client, legacy_key="legacy-value")
 
 
 async def test_chat_client_agent_run(client: SupportsChatGetResponse) -> None:
@@ -177,6 +301,56 @@ async def test_chat_client_agent_streaming_response_format_from_run_options(
     assert result.value.greeting == "Hi"
 
 
+async def test_chat_client_agent_response_format_dict_from_default_options(
+    client: SupportsChatGetResponse,
+) -> None:
+    """AgentResponse.value should parse JSON dicts from default_options response_format."""
+    json_text = json.dumps({"greeting": "Hello"})
+    client.responses.append(ChatResponse(messages=Message(role="assistant", contents=[json_text])))  # type: ignore[attr-defined]
+
+    agent = Agent(
+        client=client,
+        default_options={"response_format": {"type": "object", "properties": {"greeting": {"type": "string"}}}},
+    )
+    result = await agent.run("Hello")
+
+    assert result.text == json_text
+    assert result.value is not None
+    assert isinstance(result.value, dict)
+    assert result.value["greeting"] == "Hello"
+
+
+async def test_chat_client_agent_streaming_response_format_dict_from_run_options(
+    client: SupportsChatGetResponse,
+) -> None:
+    """Agent streaming should preserve mapping response_format and parse the final value as a dict."""
+    json_text = json.dumps({"greeting": "Hi"})
+    client.streaming_responses.append(  # type: ignore[attr-defined]
+        [
+            ChatResponseUpdate(
+                contents=[Content.from_text(json_text)],
+                role="assistant",
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    agent = Agent(client=client)
+    stream = agent.run(
+        "Hello",
+        stream=True,
+        options={"response_format": {"type": "object", "properties": {"greeting": {"type": "string"}}}},
+    )
+    async for _ in stream:
+        pass
+    result = await stream.get_final_response()
+
+    assert result.text == json_text
+    assert result.value is not None
+    assert isinstance(result.value, dict)
+    assert result.value["greeting"] == "Hi"
+
+
 async def test_chat_client_agent_create_session(
     client: SupportsChatGetResponse,
 ) -> None:
@@ -192,13 +366,13 @@ async def test_chat_client_agent_prepare_session_and_messages(
     from agent_framework._sessions import InMemoryHistoryProvider
 
     agent = Agent(client=client, context_providers=[InMemoryHistoryProvider()])
-    message = Message(role="user", text="Hello")
+    message = Message(role="user", contents=["Hello"])
     session = AgentSession()
     session.state[InMemoryHistoryProvider.DEFAULT_SOURCE_ID] = {"messages": [message]}
 
     session_context, _ = await agent._prepare_session_and_messages(  # type: ignore[reportPrivateUsage]
         session=session,
-        input_messages=[Message(role="user", text="Test")],
+        input_messages=[Message(role="user", contents=["Test"])],
     )
     result_messages = session_context.get_messages(include_input=True)
 
@@ -219,7 +393,7 @@ async def test_prepare_session_does_not_mutate_agent_chat_options(
 
     _, prepared_chat_options = await agent._prepare_session_and_messages(  # type: ignore[reportPrivateUsage]
         session=session,
-        input_messages=[Message(role="user", text="Test")],
+        input_messages=[Message(role="user", contents=["Test"])],
     )
 
     assert prepared_chat_options.get("tools") is not None
@@ -229,33 +403,445 @@ async def test_prepare_session_does_not_mutate_agent_chat_options(
     assert len(agent.default_options["tools"]) == 1
 
 
-async def test_prepare_run_context_keeps_compaction_overrides_out_of_kwargs(
+async def test_prepare_run_context_handles_function_kwargs(
     chat_client_base: SupportsChatGetResponse,
 ) -> None:
-    strategy = SlidingWindowStrategy(keep_last_groups=2)
-    tokenizer = _FixedTokenizer(13)
     agent = Agent(client=chat_client_base)
+    session = agent.create_session()
 
     ctx = await agent._prepare_run_context(  # type: ignore[reportPrivateUsage]
-        messages=[Message(role="user", text="Hello")],
-        session=None,
+        messages="Hello",
+        session=session,
         tools=None,
-        options=None,
-        compaction_strategy=strategy,
-        tokenizer=tokenizer,
-        kwargs={"custom_flag": True},
+        options={
+            "temperature": 0.4,
+            "additional_function_arguments": {"from_options": "options-value"},
+        },
+        compaction_strategy=None,
+        tokenizer=None,
+        function_invocation_kwargs={"runtime_key": "runtime-value"},
+        client_kwargs={"client_key": "client-value"},
     )
 
-    assert ctx["compaction_strategy"] is strategy
-    assert ctx["tokenizer"] is tokenizer
-    assert ctx["filtered_kwargs"].get("custom_flag") is True
-    assert "compaction_strategy" not in ctx["filtered_kwargs"]
-    assert "tokenizer" not in ctx["filtered_kwargs"]
+    assert ctx["chat_options"]["temperature"] == 0.4
+    assert "additional_function_arguments" not in ctx["chat_options"]
+    assert ctx["function_invocation_kwargs"]["from_options"] == "options-value"
+    assert ctx["function_invocation_kwargs"]["runtime_key"] == "runtime-value"
+    assert "session" not in ctx["function_invocation_kwargs"]
+    assert ctx["client_kwargs"]["client_key"] == "client-value"
+    assert ctx["client_kwargs"]["session"] is session
 
 
-async def test_chat_client_agent_run_with_session(
+async def test_chat_agent_persists_history_per_service_call(
     chat_client_base: SupportsChatGetResponse,
 ) -> None:
+    provider = _RecordingHistoryProvider()
+
+    @tool(name="lookup_weather", approval_mode="never_require")
+    def lookup_weather(location: str) -> str:
+        return f"Weather in {location}: sunny"
+
+    session = AgentSession()
+    session.state[provider.source_id] = {
+        "messages": [
+            Message(role="user", contents=["Earlier question"]),
+            Message(role="assistant", contents=["Earlier answer"]),
+        ]
+    }
+    chat_client_base.run_responses = [
+        ChatResponse(
+            messages=Message(
+                role="assistant",
+                contents=[
+                    Content.from_function_call(
+                        call_id="call_1",
+                        name="lookup_weather",
+                        arguments='{"location": "Seattle"}',
+                    )
+                ],
+            ),
+            response_id="resp_call_1",
+        ),
+        ChatResponse(
+            messages=Message(role="assistant", contents=["It is sunny in Seattle."]), response_id="resp_call_2"
+        ),
+    ]
+
+    agent = Agent(
+        client=chat_client_base,
+        tools=[lookup_weather],
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    result = await agent.run("What's the weather in Seattle?", session=session)
+
+    provider_state = session.state[provider.source_id]
+    stored_messages = cast(list[Message], provider_state["messages"])
+
+    assert result.text == "It is sunny in Seattle."
+    assert result.response_id is None
+    assert chat_client_base.call_count == 2
+    assert provider_state["get_call_count"] == 2
+    assert provider_state["save_call_count"] == 2
+    assert stored_messages[-1].text == "It is sunny in Seattle."
+    assert session.service_session_id is None
+
+
+async def test_chat_agent_persists_history_per_service_call_streaming(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    provider = _RecordingHistoryProvider()
+
+    @tool(name="lookup_weather", approval_mode="never_require")
+    def lookup_weather(location: str) -> str:
+        return f"Weather in {location}: sunny"
+
+    session = AgentSession()
+    session.state[provider.source_id] = {
+        "messages": [
+            Message(role="user", contents=["Earlier question"]),
+            Message(role="assistant", contents=["Earlier answer"]),
+        ]
+    }
+    chat_client_base.streaming_responses = [
+        [
+            ChatResponseUpdate(
+                contents=[
+                    Content.from_function_call(
+                        call_id="call_1",
+                        name="lookup_weather",
+                        arguments='{"location": "Seattle"}',
+                    )
+                ],
+                role="assistant",
+                finish_reason="stop",
+                response_id="resp_call_1",
+            )
+        ],
+        [
+            ChatResponseUpdate(
+                contents=[Content.from_text("It is sunny in Seattle.")],
+                role="assistant",
+                finish_reason="stop",
+                response_id="resp_call_2",
+            )
+        ],
+    ]
+
+    agent = Agent(
+        client=chat_client_base,
+        tools=[lookup_weather],
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    stream = agent.run("What's the weather in Seattle?", session=session, stream=True)
+    async for _ in stream:
+        pass
+    result = await stream.get_final_response()
+
+    provider_state = session.state[provider.source_id]
+    stored_messages = cast(list[Message], provider_state["messages"])
+
+    assert result.text == "It is sunny in Seattle."
+    assert result.response_id is None
+    assert chat_client_base.call_count == 2
+    assert provider_state["get_call_count"] == 2
+    assert provider_state["save_call_count"] == 2
+    assert stored_messages[-1].text == "It is sunny in Seattle."
+    assert session.service_session_id is None
+
+
+async def test_streaming_per_service_call_persistence_hides_response_id_from_after_run(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    provider = _ResponseIdRecordingHistoryProvider()
+
+    @tool(name="lookup_weather", approval_mode="never_require")
+    def lookup_weather(location: str) -> str:
+        return f"Weather in {location}: sunny"
+
+    session = AgentSession()
+    session.state[provider.source_id] = {"messages": []}
+    chat_client_base.streaming_responses = [
+        [
+            ChatResponseUpdate(
+                contents=[
+                    Content.from_function_call(
+                        call_id="call_1",
+                        name="lookup_weather",
+                        arguments='{"location": "Seattle"}',
+                    )
+                ],
+                role="assistant",
+                finish_reason="stop",
+                response_id="resp_call_1",
+            )
+        ],
+        [
+            ChatResponseUpdate(
+                contents=[Content.from_text("It is sunny in Seattle.")],
+                role="assistant",
+                finish_reason="stop",
+                response_id="resp_call_2",
+            )
+        ],
+    ]
+
+    agent = Agent(
+        client=chat_client_base,
+        tools=[lookup_weather],
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    stream = agent.run("What's the weather in Seattle?", session=session, stream=True)
+    async for _ in stream:
+        pass
+    result = await stream.get_final_response()
+
+    provider_state = session.state[provider.source_id]
+
+    assert result.response_id is None
+    assert provider_state["response_ids"] == [None, None]
+
+
+async def test_per_service_call_persistence_uses_real_service_storage_when_client_stores_by_default(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    provider = _RecordingHistoryProvider()
+
+    @tool(name="lookup_weather", approval_mode="never_require")
+    def lookup_weather(location: str) -> str:
+        return f"Weather in {location}: sunny"
+
+    chat_client_base.STORES_BY_DEFAULT = True  # type: ignore[attr-defined]
+
+    session = AgentSession()
+    session.state[provider.source_id] = {"messages": []}
+    chat_client_base.run_responses = [
+        ChatResponse(
+            messages=Message(
+                role="assistant",
+                contents=[
+                    Content.from_function_call(
+                        call_id="call_1",
+                        name="lookup_weather",
+                        arguments='{"location": "Seattle"}',
+                    )
+                ],
+            ),
+            conversation_id="resp_service_managed",
+            response_id="resp_call_1",
+        ),
+        ChatResponse(
+            messages=Message(role="assistant", contents=["It is sunny in Seattle."]),
+            conversation_id="resp_service_managed",
+            response_id="resp_call_2",
+        ),
+    ]
+
+    agent = Agent(
+        client=chat_client_base,
+        tools=[lookup_weather],
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    result = await agent.run("What's the weather in Seattle?", session=session)
+
+    provider_state = session.state[provider.source_id]
+
+    assert result.text == "It is sunny in Seattle."
+    assert result.response_id == "resp_call_2"
+    assert chat_client_base.call_count == 2
+    assert "get_call_count" not in provider_state
+    assert "save_call_count" not in provider_state
+    assert session.service_session_id == "resp_service_managed"
+
+
+async def test_service_storage_updates_session_handle_per_service_call_before_non_streaming_failure(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    provider = _RecordingHistoryProvider()
+
+    @tool(name="lookup_weather", approval_mode="never_require")
+    def lookup_weather(location: str) -> str:
+        return f"Weather in {location}: sunny"
+
+    chat_client_base.STORES_BY_DEFAULT = True  # type: ignore[attr-defined]
+
+    session = AgentSession()
+    session.state[provider.source_id] = {"messages": []}
+    first_response = ChatResponse(
+        messages=Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(
+                    call_id="call_1",
+                    name="lookup_weather",
+                    arguments='{"location": "Seattle"}',
+                )
+            ],
+        ),
+        conversation_id="resp_call_1",
+        response_id="resp_call_1",
+    )
+    mock_get_non_streaming_response = AsyncMock(
+        side_effect=[first_response, RuntimeError("service down")],
+    )
+
+    agent = Agent(
+        client=chat_client_base,
+        tools=[lookup_weather],
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    with (
+        patch.object(chat_client_base, "_get_non_streaming_response", new=mock_get_non_streaming_response),
+        pytest.raises(RuntimeError, match="service down"),
+    ):
+        await agent.run("What's the weather in Seattle?", session=session)
+
+    assert mock_get_non_streaming_response.await_count == 2
+    assert session.service_session_id == "resp_call_1"
+
+
+async def test_service_storage_updates_session_handle_per_service_call_before_streaming_failure(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    provider = _RecordingHistoryProvider()
+
+    @tool(name="lookup_weather", approval_mode="never_require")
+    def lookup_weather(location: str) -> str:
+        return f"Weather in {location}: sunny"
+
+    chat_client_base.STORES_BY_DEFAULT = True  # type: ignore[attr-defined]
+
+    session = AgentSession()
+    session.state[provider.source_id] = {"messages": []}
+
+    async def _first_stream_updates() -> AsyncIterable[ChatResponseUpdate]:
+        yield ChatResponseUpdate(
+            contents=[
+                Content.from_function_call(
+                    call_id="call_1",
+                    name="lookup_weather",
+                    arguments='{"location": "Seattle"}',
+                )
+            ],
+            role="assistant",
+            finish_reason="stop",
+        )
+
+    def _finalize_first_stream(_updates: Sequence[ChatResponseUpdate]) -> ChatResponse[Any]:
+        return ChatResponse(
+            messages=Message(
+                role="assistant",
+                contents=[
+                    Content.from_function_call(
+                        call_id="call_1",
+                        name="lookup_weather",
+                        arguments='{"location": "Seattle"}',
+                    )
+                ],
+            ),
+            conversation_id="resp_call_1",
+            response_id="resp_call_1",
+        )
+
+    first_stream = ResponseStream(_first_stream_updates(), finalizer=_finalize_first_stream)
+    mock_get_streaming_response = MagicMock(side_effect=[first_stream, RuntimeError("service down")])
+
+    agent = Agent(
+        client=chat_client_base,
+        tools=[lookup_weather],
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    with (
+        patch.object(chat_client_base, "_get_streaming_response", new=mock_get_streaming_response),
+        pytest.raises(RuntimeError, match="service down"),
+    ):
+        stream = agent.run("What's the weather in Seattle?", session=session, stream=True)
+        async for _ in stream:
+            pass
+
+    assert mock_get_streaming_response.call_count == 2
+    assert session.service_session_id == "resp_call_1"
+
+
+async def test_chat_agent_without_per_service_call_persistence_preserves_response_id(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    chat_client_base.run_responses = [
+        ChatResponse(
+            messages=Message(role="assistant", contents=["Hello"]),
+            response_id="resp_call_1",
+        )
+    ]
+
+    agent = Agent(
+        client=chat_client_base,
+        context_providers=[InMemoryHistoryProvider()],
+    )
+
+    result = await agent.run("Hello", session=AgentSession(), options={"store": False})
+
+    assert result.response_id == "resp_call_1"
+
+
+async def test_per_service_call_persistence_rejects_real_service_conversation_id(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    provider = _RecordingHistoryProvider()
+    chat_client_base.STORES_BY_DEFAULT = True  # type: ignore[attr-defined]
+    session = AgentSession()
+    session.state[provider.source_id] = {"messages": []}
+    chat_client_base.run_responses = [
+        ChatResponse(
+            messages=Message(role="assistant", contents=["Hello"]),
+            conversation_id="resp_service_managed",
+        )
+    ]
+
+    agent = Agent(
+        client=chat_client_base,
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    with pytest.raises(
+        ChatClientInvalidResponseException,
+        match="require_per_service_call_history_persistence cannot be used",
+    ):
+        await agent.run("Hello", session=session, options={"store": False})
+
+
+async def test_per_service_call_persistence_rejects_existing_conversation_id_when_service_not_storing_history(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    provider = _RecordingHistoryProvider()
+    session = AgentSession()
+    session.state[provider.source_id] = {"messages": []}
+
+    agent = Agent(
+        client=chat_client_base,
+        context_providers=[provider],
+        require_per_service_call_history_persistence=True,
+    )
+
+    with pytest.raises(
+        AgentInvalidRequestException,
+        match="require_per_service_call_history_persistence cannot be used",
+    ):
+        await agent.run("Hello", session=session, options={"store": False, "conversation_id": "existing_conversation"})
+
+
+async def test_chat_client_agent_run_with_session(chat_client_base: SupportsChatGetResponse) -> None:
     mock_response = ChatResponse(
         messages=[Message(role="assistant", contents=[Content.from_text("test response")])],
         conversation_id="123",
@@ -527,7 +1113,7 @@ async def test_chat_client_agent_author_name_is_used_from_response(
 
 
 # Mock context provider for testing
-class MockContextProvider(BaseContextProvider):
+class MockContextProvider(ContextProvider):
     def __init__(self, messages: list[Message] | None = None) -> None:
         super().__init__(source_id="mock")
         self.context_messages = messages
@@ -554,7 +1140,7 @@ async def test_chat_agent_context_providers_model_before_run(
     client: SupportsChatGetResponse,
 ) -> None:
     """Test that context providers' before_run is called during agent run."""
-    mock_provider = MockContextProvider(messages=[Message(role="system", text="Test context instructions")])
+    mock_provider = MockContextProvider(messages=[Message(role="system", contents=["Test context instructions"])])
     agent = Agent(client=client, context_providers=[mock_provider])
 
     await agent.run("Hello")
@@ -601,7 +1187,7 @@ async def test_chat_agent_context_instructions_in_messages(
     client: SupportsChatGetResponse,
 ) -> None:
     """Test that AI context instructions are included in messages."""
-    mock_provider = MockContextProvider(messages=[Message(role="system", text="Context-specific instructions")])
+    mock_provider = MockContextProvider(messages=[Message(role="system", contents=["Context-specific instructions"])])
     agent = Agent(
         client=client,
         instructions="Agent instructions",
@@ -610,7 +1196,7 @@ async def test_chat_agent_context_instructions_in_messages(
 
     # We need to test the _prepare_session_and_messages method directly
     session_context, _ = await agent._prepare_session_and_messages(  # type: ignore[reportPrivateUsage]
-        session=None, input_messages=[Message(role="user", text="Hello")]
+        session=None, input_messages=[Message(role="user", contents=["Hello"])]
     )
     messages = session_context.get_messages(include_input=True)
 
@@ -635,7 +1221,7 @@ async def test_chat_agent_no_context_instructions(
     )
 
     session_context, _ = await agent._prepare_session_and_messages(  # type: ignore[reportPrivateUsage]
-        session=None, input_messages=[Message(role="user", text="Hello")]
+        session=None, input_messages=[Message(role="user", contents=["Hello"])]
     )
     messages = session_context.get_messages(include_input=True)
 
@@ -649,7 +1235,7 @@ async def test_chat_agent_run_stream_context_providers(
     client: SupportsChatGetResponse,
 ) -> None:
     """Test that context providers work with run method."""
-    mock_provider = MockContextProvider(messages=[Message(role="system", text="Stream context instructions")])
+    mock_provider = MockContextProvider(messages=[Message(role="system", contents=["Stream context instructions"])])
     agent = Agent(client=client, context_providers=[mock_provider])
 
     # Collect all stream updates and get final response
@@ -696,8 +1282,9 @@ async def test_chat_agent_as_tool_basic(client: SupportsChatGetResponse) -> None
 
     assert tool.name == "TestAgent"
     assert tool.description == "Test agent for as_tool"
+    assert tool.approval_mode == "never_require"
     assert hasattr(tool, "func")
-    assert hasattr(tool, "input_model")
+    assert tool.input_model is None
 
 
 async def test_chat_agent_as_tool_custom_parameters(
@@ -711,13 +1298,15 @@ async def test_chat_agent_as_tool_custom_parameters(
         description="Custom description",
         arg_name="query",
         arg_description="Custom input description",
+        approval_mode="always_require",
     )
 
     assert tool.name == "CustomTool"
     assert tool.description == "Custom description"
+    assert tool.approval_mode == "always_require"
 
     # Check that the input model has the custom field name
-    schema = tool.input_model.model_json_schema()
+    schema = tool.parameters()
     assert "query" in schema["properties"]
     assert schema["properties"]["query"]["description"] == "Custom input description"
 
@@ -736,7 +1325,7 @@ async def test_chat_agent_as_tool_defaults(client: SupportsChatGetResponse) -> N
     assert tool.description == ""  # Should default to empty string
 
     # Check default input field
-    schema = tool.input_model.model_json_schema()
+    schema = tool.parameters()
     assert "task" in schema["properties"]
     assert "Task for TestAgent" in schema["properties"]["task"]["description"]
 
@@ -759,11 +1348,12 @@ async def test_chat_agent_as_tool_function_execution(
     tool = agent.as_tool()
 
     # Test function execution
-    result = await tool.invoke(arguments=tool.input_model(task="Hello"))
+    result = await tool.invoke(arguments={"task": "Hello"})
 
-    # Should return the agent's response text
-    assert isinstance(result, str)
-    assert result == "test response"  # From mock chat client
+    # Should return the agent's response text as a list of Content items
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0].text == "test streaming response another update"  # From mock streaming client
 
 
 async def test_chat_agent_as_tool_with_stream_callback(
@@ -781,14 +1371,15 @@ async def test_chat_agent_as_tool_with_stream_callback(
     tool = agent.as_tool(stream_callback=stream_callback)
 
     # Execute the tool
-    result = await tool.invoke(arguments=tool.input_model(task="Hello"))
+    result = await tool.invoke(arguments={"task": "Hello"})
 
     # Should have collected streaming updates
     assert len(collected_updates) > 0
-    assert isinstance(result, str)
+    assert isinstance(result, list)
+    result_text = result[0].text
     # Result should be concatenation of all streaming updates
     expected_text = "".join(update.text for update in collected_updates)
-    assert result == expected_text
+    assert result_text == expected_text
 
 
 async def test_chat_agent_as_tool_with_custom_arg_name(
@@ -800,8 +1391,9 @@ async def test_chat_agent_as_tool_with_custom_arg_name(
     tool = agent.as_tool(arg_name="prompt", arg_description="Custom prompt input")
 
     # Test that the custom argument name works
-    result = await tool.invoke(arguments=tool.input_model(prompt="Test prompt"))
-    assert result == "test response"
+    result = await tool.invoke(arguments={"prompt": "Test prompt"})
+    assert isinstance(result, list)
+    assert result[0].text == "test streaming response another update"
 
 
 async def test_chat_agent_as_tool_with_async_stream_callback(
@@ -819,14 +1411,15 @@ async def test_chat_agent_as_tool_with_async_stream_callback(
     tool = agent.as_tool(stream_callback=async_stream_callback)
 
     # Execute the tool
-    result = await tool.invoke(arguments=tool.input_model(task="Hello"))
+    result = await tool.invoke(arguments={"task": "Hello"})
 
     # Should have collected streaming updates
     assert len(collected_updates) > 0
-    assert isinstance(result, str)
+    assert isinstance(result, list)
+    result_text = result[0].text
     # Result should be concatenation of all streaming updates
     expected_text = "".join(update.text for update in collected_updates)
-    assert result == expected_text
+    assert result_text == expected_text
 
 
 async def test_chat_agent_as_tool_name_sanitization(
@@ -849,17 +1442,14 @@ async def test_chat_agent_as_tool_name_sanitization(
         assert tool.name == expected_tool_name, f"Expected {expected_tool_name}, got {tool.name} for input {agent_name}"
 
 
-async def test_chat_agent_as_tool_propagate_session_true(
-    client: SupportsChatGetResponse,
-) -> None:
-    """Test that propagate_session=True forwards the parent's session to the sub-agent."""
+async def test_chat_agent_as_tool_propagate_session_true(client: SupportsChatGetResponse) -> None:
+    """Test that propagate_session=True forwards the session to the sub-agent."""
     agent = Agent(client=client, name="SubAgent", description="Sub agent")
     tool = agent.as_tool(propagate_session=True)
 
     parent_session = AgentSession(session_id="parent-session-123")
     parent_session.state["shared_key"] = "shared_value"
 
-    # Spy on the agent's run method to capture the session argument
     original_run = agent.run
     captured_session = None
 
@@ -870,16 +1460,20 @@ async def test_chat_agent_as_tool_propagate_session_true(
 
     agent.run = capturing_run  # type: ignore[assignment, method-assign]
 
-    await tool.invoke(arguments=tool.input_model(task="Hello"), session=parent_session)
+    await tool.invoke(
+        context=FunctionInvocationContext(
+            function=tool,
+            arguments={"task": "Hello"},
+            session=parent_session,
+        )
+    )
 
     assert captured_session is parent_session
     assert captured_session.session_id == "parent-session-123"
     assert captured_session.state["shared_key"] == "shared_value"
 
 
-async def test_chat_agent_as_tool_propagate_session_false_by_default(
-    client: SupportsChatGetResponse,
-) -> None:
+async def test_chat_agent_as_tool_propagate_session_false_by_default(client: SupportsChatGetResponse) -> None:
     """Test that propagate_session defaults to False and does not forward the session."""
     agent = Agent(client=client, name="SubAgent", description="Sub agent")
     tool = agent.as_tool()  # default: propagate_session=False
@@ -896,22 +1490,25 @@ async def test_chat_agent_as_tool_propagate_session_false_by_default(
 
     agent.run = capturing_run  # type: ignore[assignment, method-assign]
 
-    await tool.invoke(arguments=tool.input_model(task="Hello"), session=parent_session)
+    await tool.invoke(
+        context=FunctionInvocationContext(
+            function=tool,
+            arguments={"task": "Hello"},
+            session=parent_session,
+        )
+    )
 
     assert captured_session is None
 
 
-async def test_chat_agent_as_tool_propagate_session_shares_state(
-    client: SupportsChatGetResponse,
-) -> None:
-    """Test that shared session allows the sub-agent to read and write parent's state."""
+async def test_chat_agent_as_tool_propagate_session_shares_state(client: SupportsChatGetResponse) -> None:
+    """Test that a propagated session allows the sub-agent to read and write parent state."""
     agent = Agent(client=client, name="SubAgent", description="Sub agent")
     tool = agent.as_tool(propagate_session=True)
 
     parent_session = AgentSession(session_id="shared-session")
     parent_session.state["counter"] = 0
 
-    # The sub-agent receives the same session object, so mutations are shared
     original_run = agent.run
     captured_session = None
 
@@ -924,9 +1521,14 @@ async def test_chat_agent_as_tool_propagate_session_shares_state(
 
     agent.run = capturing_run  # type: ignore[assignment, method-assign]
 
-    await tool.invoke(arguments=tool.input_model(task="Hello"), session=parent_session)
+    await tool.invoke(
+        context=FunctionInvocationContext(
+            function=tool,
+            arguments={"task": "Hello"},
+            session=parent_session,
+        )
+    )
 
-    # The parent's state should reflect the sub-agent's mutation
     assert parent_session.state["counter"] == 1
 
 
@@ -949,6 +1551,7 @@ async def test_chat_agent_run_with_mcp_tools(client: SupportsChatGetResponse) ->
 
     # Create a mock MCP tool
     mock_mcp_tool = MagicMock(spec=MCPTool)
+    mock_mcp_tool.name = "mock-mcp"
     mock_mcp_tool.is_connected = False
     mock_mcp_tool.functions = [MagicMock()]
 
@@ -966,6 +1569,7 @@ async def test_chat_agent_with_local_mcp_tools(client: SupportsChatGetResponse) 
     """Test agent initialization with local MCP tools."""
     # Create a mock MCP tool
     mock_mcp_tool = MagicMock(spec=MCPTool)
+    mock_mcp_tool.name = "mock-mcp"
     mock_mcp_tool.is_connected = False
     mock_mcp_tool.__aenter__ = AsyncMock(return_value=mock_mcp_tool)
     mock_mcp_tool.__aexit__ = AsyncMock(return_value=None)
@@ -1005,6 +1609,7 @@ async def test_mcp_tools_not_duplicated_when_passed_as_runtime_tools(
 
     # Create a mock MCP tool that is already connected (simulates turn 2)
     mock_mcp_tool = MagicMock(spec=MCPTool)
+    mock_mcp_tool.name = "mock-mcp"
     mock_mcp_tool.is_connected = True
     mock_mcp_tool.functions = [mcp_func_a, mcp_func_b]
     mock_mcp_tool.__aenter__ = AsyncMock(return_value=mock_mcp_tool)
@@ -1028,8 +1633,79 @@ async def test_mcp_tools_not_duplicated_when_passed_as_runtime_tools(
     assert len(tool_names) == 3
 
 
-async def test_agent_tool_receives_session_in_kwargs(chat_client_base: Any) -> None:
-    """Verify tool execution receives 'session' inside **kwargs when function is called by client."""
+async def test_agent_run_raises_on_local_and_agent_mcp_name_conflict(chat_client_base: Any) -> None:
+    local_tool = FunctionTool(
+        func=lambda: "local",
+        name="delete_all_data",
+        description="Local protected tool",
+        approval_mode="always_require",
+    )
+    agent = Agent(
+        client=chat_client_base,
+        name="TestAgent",
+        tools=[_ConnectedMCPTool(name="dangerous-mcp", function_names=["delete_all_data"])],
+    )
+
+    with raises(ValueError, match="tool_name_prefix"):
+        await agent.run("hello", tools=[local_tool])
+
+
+async def test_agent_run_raises_on_runtime_local_and_runtime_mcp_name_conflict(chat_client_base: Any) -> None:
+    local_tool = FunctionTool(
+        func=lambda: "local",
+        name="delete_all_data",
+        description="Local protected tool",
+        approval_mode="always_require",
+    )
+    runtime_mcp = _ConnectedMCPTool(name="dangerous-mcp", function_names=["delete_all_data"])
+    agent = Agent(client=chat_client_base, name="TestAgent")
+
+    with raises(ValueError, match="tool_name_prefix"):
+        await agent.run("hello", tools=[local_tool, runtime_mcp])
+
+
+async def test_agent_run_raises_on_duplicate_agent_mcp_names(chat_client_base: Any) -> None:
+    agent = Agent(
+        client=chat_client_base,
+        name="TestAgent",
+        tools=[
+            _ConnectedMCPTool(name="docs-mcp", function_names=["search"]),
+            _ConnectedMCPTool(name="github-mcp", function_names=["search"]),
+        ],
+    )
+
+    with raises(ValueError, match="tool_name_prefix"):
+        await agent.run("hello")
+
+
+async def test_agent_run_accepts_prefixed_mcp_tools(chat_client_base: Any) -> None:
+    captured_options: list[dict[str, Any]] = []
+
+    original_inner = chat_client_base._inner_get_response
+
+    async def capturing_inner(
+        *, messages: MutableSequence[Message], options: dict[str, Any], **kwargs: Any
+    ) -> ChatResponse:
+        captured_options.append(dict(options))
+        return await original_inner(messages=messages, options=options, **kwargs)
+
+    chat_client_base._inner_get_response = capturing_inner
+
+    local_tool = FunctionTool(func=lambda: "local", name="search", description="Local search tool")
+    agent = Agent(
+        client=chat_client_base,
+        name="TestAgent",
+        tools=[_ConnectedMCPTool(name="docs-mcp", function_names=["search"], tool_name_prefix="docs")],
+    )
+
+    await agent.run("hello", tools=[local_tool])
+
+    tool_names = [tool.name for tool in captured_options[0]["tools"]]
+    assert tool_names == ["search", "docs_search"]
+
+
+async def test_agent_tool_without_context_does_not_receive_session(chat_client_base: Any) -> None:
+    """Verify tools without FunctionInvocationContext no longer receive injected session kwargs."""
 
     captured: dict[str, Any] = {}
 
@@ -1040,7 +1716,6 @@ async def test_agent_tool_receives_session_in_kwargs(chat_client_base: Any) -> N
         captured["has_state"] = session.state is not None if isinstance(session, AgentSession) else False
         return f"echo: {text}"
 
-    # Make the base client emit a function call for our tool
     chat_client_base.run_responses = [
         ChatResponse(
             messages=Message(
@@ -1054,21 +1729,56 @@ async def test_agent_tool_receives_session_in_kwargs(chat_client_base: Any) -> N
                 ],
             )
         ),
-        ChatResponse(messages=Message(role="assistant", text="done")),
+        ChatResponse(messages=Message(role="assistant", contents=["done"])),
     ]
 
     agent = Agent(client=chat_client_base, tools=[echo_session_info])
     session = agent.create_session()
 
-    result = await agent.run(
-        "hello",
-        session=session,
-        options={"additional_function_arguments": {"session": session}},
-    )
+    result = await agent.run("hello", session=session)
 
     assert result.text == "done"
-    assert captured.get("has_session") is True
-    assert captured.get("has_state") is True
+    assert captured.get("has_session") is False
+    assert captured.get("has_state") is False
+
+
+async def test_agent_tool_receives_explicit_session_via_function_invocation_context_kwargs(
+    chat_client_base: Any,
+) -> None:
+    """Verify ctx-based tools receive the session via FunctionInvocationContext.session."""
+
+    captured: dict[str, Any] = {}
+
+    @tool(name="capture_session_context", approval_mode="never_require")
+    def capture_session_context(text: str, ctx: FunctionInvocationContext) -> str:
+        captured["session"] = ctx.session
+        captured["has_state"] = ctx.session.state is not None if isinstance(ctx.session, AgentSession) else False
+        return f"echo: {text}"
+
+    chat_client_base.run_responses = [
+        ChatResponse(
+            messages=Message(
+                role="assistant",
+                contents=[
+                    Content.from_function_call(
+                        call_id="1",
+                        name="capture_session_context",
+                        arguments='{"text": "hello"}',
+                    )
+                ],
+            )
+        ),
+        ChatResponse(messages=Message(role="assistant", contents=["done"])),
+    ]
+
+    agent = Agent(client=chat_client_base, tools=[capture_session_context])
+    session = agent.create_session()
+
+    result = await agent.run("hello", session=session)
+
+    assert result.text == "done"
+    assert captured["session"] is session
+    assert captured["has_state"] is True
 
 
 async def test_chat_agent_tool_choice_run_level_overrides_agent_level(chat_client_base: Any, tool_tool: Any) -> None:
@@ -1091,7 +1801,7 @@ async def test_chat_agent_tool_choice_run_level_overrides_agent_level(chat_clien
     agent = Agent(
         client=chat_client_base,
         tools=[tool_tool],
-        options={"tool_choice": "auto"},
+        default_options={"tool_choice": "auto"},
     )
 
     # Run with run-level tool_choice="required"
@@ -1191,8 +1901,8 @@ async def test_chat_agent_compaction_overrides_client_defaults(chat_client_base:
     )
 
     await agent.run([
-        Message(role="user", text="Hello"),
-        Message(role="assistant", text="Previous response"),
+        Message(role="user", contents=["Hello"]),
+        Message(role="assistant", contents=["Previous response"]),
     ])
 
     assert captured_roles == [["user", "assistant"]]
@@ -1216,8 +1926,8 @@ async def test_chat_agent_uses_client_compaction_defaults_when_agent_unset(chat_
     agent = Agent(client=chat_client_base)
 
     await agent.run([
-        Message(role="user", text="Hello"),
-        Message(role="assistant", text="Previous response"),
+        Message(role="user", contents=["Hello"]),
+        Message(role="assistant", contents=["Previous response"]),
     ])
 
     assert captured_roles == [["assistant"]]
@@ -1249,8 +1959,8 @@ async def test_chat_agent_run_level_compaction_and_tokenizer_override_agent_defa
 
     await agent.run(
         [
-            Message(role="user", text="Hello"),
-            Message(role="assistant", text="Previous response"),
+            Message(role="user", contents=["Hello"]),
+            Message(role="assistant", contents=["Previous response"]),
         ],
         compaction_strategy=TruncationStrategy(max_n=1, compact_to=1),
         tokenizer=_FixedTokenizer(23),
@@ -1286,8 +1996,22 @@ def test_merge_options_none_values_ignored():
     assert result["key2"] == "value2"
 
 
+def test_merge_options_runtime_model_overrides_default_model() -> None:
+    """Test _merge_options lets a runtime model override a default model."""
+    result = _merge_options({"model": "default-model"}, {"model": "runtime-model"})
+
+    assert result["model"] == "runtime-model"
+
+
+def test_merge_options_preserves_base_model_without_override() -> None:
+    """Test _merge_options preserves the base model when there is no override."""
+    result = _merge_options({"model": "preferred-model"}, {})
+
+    assert result["model"] == "preferred-model"
+
+
 def test_merge_options_tools_combined():
-    """Test _merge_options combines tool lists without duplicates."""
+    """Test _merge_options raises when distinct tools share the same name."""
 
     class MockTool:
         def __init__(self, name):
@@ -1300,13 +2024,8 @@ def test_merge_options_tools_combined():
     base = {"tools": [tool1]}
     override = {"tools": [tool2, tool3]}
 
-    result = _merge_options(base, override)
-
-    # Should have tool1 and tool2, but not duplicate tool3
-    assert len(result["tools"]) == 2
-    tool_names = [t.name for t in result["tools"]]
-    assert "tool1" in tool_names
-    assert "tool2" in tool_names
+    with raises(ValueError, match="Duplicate tool name 'tool1'"):
+        _merge_options(base, override)
 
 
 def test_merge_options_dict_tools_combined():
@@ -1331,7 +2050,7 @@ def test_merge_options_dict_tools_combined():
 
 
 def test_merge_options_dict_tools_deduplicates():
-    """Test _merge_options deduplicates dict-defined tools by function name."""
+    """Test _merge_options raises on duplicate dict-defined tool names."""
     base = {
         "tools": [
             {"type": "function", "function": {"name": "tool_a"}},
@@ -1344,12 +2063,8 @@ def test_merge_options_dict_tools_deduplicates():
         ]
     }
 
-    result = _merge_options(base, override)
-
-    assert len(result["tools"]) == 2
-    names = [_get_tool_name(t) for t in result["tools"]]
-    assert names.count("tool_a") == 1
-    assert "tool_b" in names
+    with raises(ValueError, match="Duplicate tool name 'tool_a'"):
+        _merge_options(base, override)
 
 
 def test_merge_options_mixed_tools_combined():
@@ -1375,7 +2090,7 @@ def test_merge_options_mixed_tools_combined():
 
 
 def test_merge_options_mixed_tools_deduplicates():
-    """Test _merge_options deduplicates when a dict tool and object tool share the same name."""
+    """Test _merge_options raises when a dict tool and object tool share the same name."""
 
     class MockTool:
         def __init__(self, name):
@@ -1388,10 +2103,8 @@ def test_merge_options_mixed_tools_deduplicates():
         ]
     }
 
-    result = _merge_options(base, override)
-
-    assert len(result["tools"]) == 1
-    assert _get_tool_name(result["tools"][0]) == "tool_a"
+    with raises(ValueError, match="Duplicate tool name 'tool_a'"):
+        _merge_options(base, override)
 
 
 def test_merge_options_nameless_tools_not_deduplicated():
@@ -1411,6 +2124,20 @@ def test_merge_options_nameless_tools_not_deduplicated():
 
     # Both nameless tools should be kept (None is excluded from dedup set)
     assert len(result["tools"]) == 2
+
+
+def test_merge_options_same_tool_object_kept_once():
+    """Test _merge_options silently keeps a repeated reference to the same tool object once."""
+
+    class MockTool:
+        def __init__(self, name):
+            self.name = name
+
+    tool_a = MockTool("tool_a")
+
+    result = _merge_options({"tools": [tool_a]}, {"tools": [tool_a]})
+
+    assert result["tools"] == [tool_a]
 
 
 def test_get_tool_name_dict_no_function_key():
@@ -1537,7 +2264,7 @@ async def test_agent_create_session_with_context_providers(
 ):
     """Test that create_session works when context_providers are set on the agent."""
 
-    class TestContextProvider(BaseContextProvider):
+    class TestContextProvider(ContextProvider):
         def __init__(self):
             super().__init__(source_id="test")
 
@@ -1612,7 +2339,7 @@ async def test_chat_agent_context_provider_adds_tools_when_agent_has_none(
         """A tool provided by context."""
         return text
 
-    class ToolContextProvider(BaseContextProvider):
+    class ToolContextProvider(ContextProvider):
         def __init__(self):
             super().__init__(source_id="tool-context")
 
@@ -1627,7 +2354,7 @@ async def test_chat_agent_context_provider_adds_tools_when_agent_has_none(
 
     # Run the agent and verify context tools are added
     _, options = await agent._prepare_session_and_messages(  # type: ignore[reportPrivateUsage]
-        session=None, input_messages=[Message(role="user", text="Hello")]
+        session=None, input_messages=[Message(role="user", contents=["Hello"])]
     )
 
     # The context tools should now be in the options
@@ -1641,7 +2368,7 @@ async def test_chat_agent_context_provider_adds_instructions_when_agent_has_none
 ):
     """Test that context provider instructions are used when agent has no default instructions."""
 
-    class InstructionContextProvider(BaseContextProvider):
+    class InstructionContextProvider(ContextProvider):
         def __init__(self):
             super().__init__(source_id="instruction-context")
 
@@ -1656,11 +2383,38 @@ async def test_chat_agent_context_provider_adds_instructions_when_agent_has_none
 
     # Run the agent and verify context instructions are available
     _, options = await agent._prepare_session_and_messages(  # type: ignore[reportPrivateUsage]
-        session=None, input_messages=[Message(role="user", text="Hello")]
+        session=None, input_messages=[Message(role="user", contents=["Hello"])]
     )
 
     # The context instructions should now be in the options
     assert options.get("instructions") == "Context-provided instructions"
+
+
+async def test_chat_agent_context_provider_adds_middleware_when_agent_has_none(
+    chat_client_base: SupportsChatGetResponse,
+) -> None:
+    """Test that context provider middleware is collected during preparation."""
+
+    @chat_middleware
+    async def context_chat_middleware(context: ChatContext, call_next: Callable[[], Awaitable[None]]) -> None:
+        await call_next()
+
+    class MiddlewareContextProvider(ContextProvider):
+        def __init__(self) -> None:
+            super().__init__(source_id="middleware-context")
+
+        async def before_run(self, *, agent, session, context, state) -> None:
+            context.extend_middleware("middleware-context", context_chat_middleware)
+
+    agent = Agent(client=chat_client_base, context_providers=[MiddlewareContextProvider()])
+
+    session_context, _ = await agent._prepare_session_and_messages(  # type: ignore[reportPrivateUsage]
+        session=None,
+        input_messages=[Message(role="user", contents=["Hello"])],
+    )
+
+    assert session_context.middleware["middleware-context"] == [context_chat_middleware]
+    assert session_context.get_middleware() == [context_chat_middleware]
 
 
 # region STORES_BY_DEFAULT tests
@@ -1754,4 +2508,148 @@ async def test_stores_by_default_with_store_false_in_default_options_injects_inm
     assert any(isinstance(p, InMemoryHistoryProvider) for p in agent.context_providers)
 
 
-# endregion
+async def test_shared_local_storage_cross_provider_responses_history_does_not_leak_fc_id() -> None:
+    """Responses-specific replay metadata should stay local to Responses when session storage is shared."""
+    from openai.types.chat.chat_completion import ChatCompletion, Choice
+    from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+    from agent_framework._sessions import InMemoryHistoryProvider
+    from agent_framework.openai import OpenAIChatClient, OpenAIChatCompletionClient
+
+    @tool(approval_mode="never_require")
+    def search_hotels(city: str) -> str:
+        return f"Found 3 hotels in {city}"
+
+    responses_client = OpenAIChatClient(model="test-model", api_key="test-key")
+    responses_agent = Agent(
+        client=responses_client,
+        tools=[search_hotels],
+        default_options={"store": False},
+    )
+    session = responses_agent.create_session()
+
+    responses_tool_call = MagicMock()
+    responses_tool_call.type = "function_call"
+    responses_tool_call.id = "fc_provider123"
+    responses_tool_call.call_id = "call_1"
+    responses_tool_call.name = "search_hotels"
+    responses_tool_call.arguments = '{"city": "Paris"}'
+    responses_tool_call.status = "completed"
+
+    responses_first = MagicMock()
+    responses_first.output_parsed = None
+    responses_first.metadata = {}
+    responses_first.usage = None
+    responses_first.id = "resp_1"
+    responses_first.model = "test-model"
+    responses_first.created_at = 1000000000
+    responses_first.status = "completed"
+    responses_first.finish_reason = "tool_calls"
+    responses_first.incomplete = None
+    responses_first.output = [responses_tool_call]
+
+    responses_text_item = MagicMock()
+    responses_text_item.type = "message"
+    responses_text_content = MagicMock()
+    responses_text_content.type = "output_text"
+    responses_text_content.text = "Hotel Lutetia is the cheapest option."
+    responses_text_item.content = [responses_text_content]
+
+    responses_second = MagicMock()
+    responses_second.output_parsed = None
+    responses_second.metadata = {}
+    responses_second.usage = None
+    responses_second.id = "resp_2"
+    responses_second.model = "test-model"
+    responses_second.created_at = 1000000001
+    responses_second.status = "completed"
+    responses_second.finish_reason = "stop"
+    responses_second.incomplete = None
+    responses_second.output = [responses_text_item]
+
+    with patch.object(
+        responses_client.client.responses,
+        "create",
+        side_effect=[responses_first, responses_second],
+    ) as mock_responses_create:
+        responses_result = await responses_agent.run("Find me a hotel in Paris", session=session)
+
+    assert responses_result.text == "Hotel Lutetia is the cheapest option."
+    assert any(isinstance(provider, InMemoryHistoryProvider) for provider in responses_agent.context_providers)
+
+    shared_messages = session.state[InMemoryHistoryProvider.DEFAULT_SOURCE_ID]["messages"]
+    shared_function_call = next(
+        content for message in shared_messages for content in message.contents if content.type == "function_call"
+    )
+    assert shared_function_call.additional_properties is not None
+    assert shared_function_call.additional_properties.get("fc_id") == "fc_provider123"
+
+    responses_replay_input = mock_responses_create.call_args_list[1].kwargs["input"]
+    responses_replay_call = next(item for item in responses_replay_input if item.get("type") == "function_call")
+    assert responses_replay_call["id"] == "fc_provider123"
+
+    chat_client = OpenAIChatCompletionClient(model="test-model", api_key="test-key")
+    chat_agent = Agent(client=chat_client)
+
+    chat_response = ChatCompletion(
+        id="chatcmpl-test",
+        object="chat.completion",
+        created=1234567890,
+        model="gpt-4o-mini",
+        choices=[
+            Choice(
+                index=0,
+                message=ChatCompletionMessage(role="assistant", content="The cheapest option is still Hotel Lutetia."),
+                finish_reason="stop",
+            )
+        ],
+    )
+
+    with patch.object(
+        chat_client.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=chat_response),
+    ) as mock_chat_create:
+        chat_result = await chat_agent.run("Which option is cheapest?", session=session)
+
+    assert chat_result.text == "The cheapest option is still Hotel Lutetia."
+
+    chat_request_messages = mock_chat_create.call_args.kwargs["messages"]
+    assistant_tool_call_message = next(
+        message for message in chat_request_messages if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert assistant_tool_call_message["tool_calls"][0]["id"] == "call_1"
+    assert assistant_tool_call_message["tool_calls"][0]["function"]["name"] == "search_hotels"
+
+    tool_result_message = next(
+        message
+        for message in chat_request_messages
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call_1"
+    )
+    assert tool_result_message["content"] == "Found 3 hotels in Paris"
+    assert "fc_provider123" not in json.dumps(chat_request_messages)
+
+
+# region as_tool user_input_request propagation
+
+
+async def test_as_tool_raises_on_user_input_request(client: SupportsChatGetResponse) -> None:
+    """Test that as_tool raises when the wrapped sub-agent requests user input."""
+    from agent_framework.exceptions import UserInputRequiredException
+
+    consent_content = Content.from_oauth_consent_request(
+        consent_link="https://login.microsoftonline.com/consent",
+    )
+    client.streaming_responses = [  # type: ignore[attr-defined]
+        [ChatResponseUpdate(contents=[consent_content], role="assistant")],
+    ]
+
+    agent = Agent(client=client, name="OAuthAgent", description="Agent requiring consent")
+    agent_tool = agent.as_tool()
+
+    with raises(UserInputRequiredException) as exc_info:
+        await agent_tool.invoke(arguments={"task": "Do something"})
+
+    assert len(exc_info.value.contents) == 1
+    assert exc_info.value.contents[0].type == "oauth_consent_request"
+    assert exc_info.value.contents[0].consent_link == "https://login.microsoftonline.com/consent"
